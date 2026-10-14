@@ -162,6 +162,28 @@ brew install insert_dylib 2>/dev/null || \
 
 ---
 
+## 3.5 注入后没效果怎么排查
+
+**第一步永远是看日志**。启动后（Console.app / `idevicesyslog` / TrollFools 的日志）搜 `AdsKiller`，按结果分三种情况：
+
+| 日志现象 | 含义 | 处理 |
+|---|---|---|
+| **完全没有 `[AdsKiller]` 字样** | dylib 根本没被加载 | TrollFools 注入没成功。改注入**裸 `.dylib`**（不要用 `.deb`），并**从 TrollFools 里启动 App**；确认注入时选的是 `com.sawadaru.qr` |
+| 有 `=== AdsKiller v2 loading (+load) ===` 但 `hooks=0` 或大量 `class not present` | 加载了但没找到目标类 | 说明加载太早/类名变了。v2 有 +load + constructor + 延时三重挂载，正常不该出现；把日志发出来 |
+| 有 `installed N hooks`，打开页面也**有** `BLOCK ...` 输出，但广告还在 | 命中了对的类但漏了调用路径 | 日志里的 `BLOCK` 行会显示是哪个类在加载，把它补进 hook 列表 |
+
+**关键排障逻辑**：如果 dylib 被注入但文件损坏/架构不对，App 会**直接闪退**。
+所以「App 能正常打开」通常意味着：要么 dylib 已生效（问题在 hook 覆盖面），要么压根没注入。
+
+App 的横幅可能的**加载路径**（v1 只覆盖了第一条，v2 全cover）：
+
+1. 显式 `-[GADBannerView loadRequest:]` —— v1 已拦
+2. **autoload**：设了 `adUnitID` + `autoloadEnabled`，SDK 自己加载，**根本不走 `loadRequest:`** —— v2 新增拦截 `-setAdUnitID:` / `-setAutoloadEnabled:`
+3. **Pangle 横幅**（`PAGBannerAd` / `PAGNativeExpressBannerView`）与 **Vungle 横幅**（`VungleBannerView`）—— v2 新增
+4. 中介层最终落地方法 `-loadAd:responseInfo:error:completionHandler:` —— v2 新增（不管请求从哪来都会经过）
+
+---
+
 ## 4. 开关与调参（`AdsKiller.m` 顶部）
 
 | 宏 | 默认 | 作用 |

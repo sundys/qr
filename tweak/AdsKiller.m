@@ -1,66 +1,73 @@
-// AdsKiller.m — SimpleQR (qrcode 4.0.3) 去广告注入 dylib
+// AdsKiller.m v2 — SimpleQR (qrcode 4.0.3) 去广告注入 dylib
 //
-// 纯 Objective-C runtime swizzling，不依赖 CydiaSubstrate / Theos 运行时，
-// 因此可以对「未越狱 + 重签名侧载」的 IPA 使用（TrollStore / Sideloadly / AltStore）。
+// 纯 Objective-C runtime swizzling，不依赖 CydiaSubstrate / Theos 运行时。
 //
-// 所有 selector 均从 SimpleQR(4.0.3) 主二进制的 __objc_classlist / metaclass 中实测提取，
-// 与之完全一致（见 analysis/ad_hook_targets.txt）。
-//
-// 设计原则：只拦截「加载」和「展示」两端，不改 SDK 初始化，
-// 这样 App 自己的失败回调（bannerView:didFailToReceiveAdWithError: 等）会正常触发，
-// 横幅高度由 App 自己收起，不需要我们去改布局。
+// v2 相对 v1 的变化（v1 注入后横幅照旧，针对可能的原因逐个补上）：
+//   1. 挂载点从「只有 constructor」改为「+load + constructor + 延时重试」，
+//      避免个别类在 constructor 时还没注册导致整批 hook 静默失效；
+//   2. 新增 autoload 路径拦截（-setAdUnitID: / -setAutoloadEnabled:）——
+//      App 若用 autoload，SDK 自己加载，根本不会走 -loadRequest:；
+//   3. 新增最终落地方法 -loadAd:responseInfo:error:completionHandler: 拦截；
+//   4. 新增 Pangle 横幅（PAGBannerAd / PAGNativeExpressBannerView）与
+//      Vungle 横幅（VungleBannerView）的加载入口；
+//   5. 启动日志带版本号与「装了几个 hook / 几个类没找到」，便于判断 dylib 是否真的生效。
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <dispatch/dispatch.h>
 
-// 用协议声明代替 objc_msgSend 强转：ARC 下 objc_msgSend 强转容易编译报错，
-// 这里只是给编译器一个契约，运行时用的还是 GADMobileAds 自己的实现。
+#define AK_VERSION "v2"
+
+#define AK_LOG(fmt, ...) NSLog(@"[AdsKiller] " fmt, ##__VA_ARGS__)
+
+// ---------- 可配置开关 ----------
+// 1 = 启动时调 AdMob 官方 API 关闭聚合中介初始化（Pangle/Vungle/Moloco/InMobi 适配器不再初始化）
+#define AK_DISABLE_MEDIATION_INIT 1
+// 1 = 加载被拦截时回调 delegate 的失败方法，让宿主 App 自己收起横幅高度
+#define AK_NOTIFY_BANNER_FAILURE 1
+// 1 = 连 AdMob SDK 初始化也拦掉（更彻底；个别 App 拿到 nil 状态会崩，默认关闭）
+#define AK_KILL_SDK_INIT 0
+// 1 = 把横幅视图 frame 高度置 0（宿主不收起横幅时的兜底）
+#define AK_COLLAPSE_BANNER_VIEW 0
+
+// ---------- 协议契约（ARC 下对 id 发未声明 selector 会编译报错） ----------
 @protocol AKGADMobileAdsShim <NSObject>
 + (instancetype)sharedInstance;
 - (void)disableMediationInitialization;
 @end
 
-// 同理：给 banner 的 delegate 一个契约，否则 ARC 下对 id 发未声明的 selector 会直接编译报错
-// （GADBannerViewDelegate 的真实签名与此一致）
 @protocol AKBannerDelegateShim <NSObject>
 - (void)bannerView:(id)bannerView didFailToReceiveAdWithError:(NSError *)error;
 @end
 
-#define AK_LOG(fmt, ...) NSLog(@"[AdsKiller] " fmt, ##__VA_ARGS__)
-
-// ---------- 可配置开关 ----------
-// 1 = 在启动时调用 AdMob 官方 API 关闭聚合中介初始化（Pangle/Vungle/Moloco/InMobi 适配器不再初始化）
-#define AK_DISABLE_MEDIATION_INIT 1
-// 1 = 加载被拦截时，主动回调 delegate 的失败方法，让宿主 App 走自己的“广告加载失败→收起横幅”逻辑
-#define AK_NOTIFY_BANNER_FAILURE 1
-// 1 = 连 AdMob SDK 初始化也拦掉（更彻底，但个别 App 拿到 nil 状态会崩，默认关闭）
-#define AK_KILL_SDK_INIT 0
-// 1 = 把横幅视图的 frame 高度置 0（宿主 App 不收起横幅时的兜底）
-#define AK_COLLAPSE_BANNER_VIEW 0
+// ---------- 统计 ----------
+static int gHooks = 0;
+static int gMissed = 0;
 
 // ---------- runtime 工具 ----------
 
-static void AKSwizzleClassMethod(Class cls, SEL sel, IMP newImp, IMP *outOld) {
+static void AKSwizzleClassMethod(Class cls, SEL sel, IMP newImp) {
     if (!cls || !sel) return;
     Method m = class_getClassMethod(cls, sel);
-    if (!m) { AK_LOG(@"class method not found: +[%@ %@]", cls, NSStringFromSelector(sel)); return; }
-    if (outOld) *outOld = method_setImplementation(m, newImp);
-    AK_LOG(@"hooked +[%@ %@]", cls, NSStringFromSelector(sel));
+    if (!m) { AK_LOG(@"  x class method not found: +[%@ %@]", cls, NSStringFromSelector(sel)); return; }
+    method_setImplementation(m, newImp);
+    gHooks++;
+    AK_LOG(@"  + hooked +[%@ %@]", cls, NSStringFromSelector(sel));
 }
 
-static void AKSwizzleInstanceMethod(Class cls, SEL sel, IMP newImp, IMP *outOld) {
+static void AKSwizzleInstanceMethod(Class cls, SEL sel, IMP newImp) {
     if (!cls || !sel) return;
     Method m = class_getInstanceMethod(cls, sel);
-    if (!m) { AK_LOG(@"instance method not found: -[%@ %@]", cls, NSStringFromSelector(sel)); return; }
-    if (outOld) *outOld = method_setImplementation(m, newImp);
-    AK_LOG(@"hooked -[%@ %@]", cls, NSStringFromSelector(sel));
+    if (!m) return;                       // 类里没这个方法就静默跳过（大量可选目标）
+    method_setImplementation(m, newImp);
+    gHooks++;
+    AK_LOG(@"  + hooked -[%@ %@]", cls, NSStringFromSelector(sel));
 }
 
 static Class AKClass(NSString *name) {
     Class c = NSClassFromString(name);
-    if (!c) AK_LOG(@"class not present (skip): %@", name);
+    if (!c) { gMissed++; AK_LOG(@"  ? class not present: %@", name); }
     return c;
 }
 
@@ -92,93 +99,92 @@ static void AKNotifyBannerFailure(id bannerView) {
 
 // ======================= AdMob (GAD) =======================
 
-// +[GADAppOpenAd|GADInterstitialAd|GADRewardedAd loadWithAdUnitID:request:completionHandler:]
 static void AKLoadFullScreenAd(id self, SEL _cmd, id adUnitID, id request, void (^completion)(id, NSError *)) {
-    AK_LOG(@"blocked %@ %@", NSStringFromClass([self class]), NSStringFromSelector(_cmd));
+    AK_LOG(@"BLOCK %@ %@", NSStringFromClass([self class]), NSStringFromSelector(_cmd));
     if (completion) completion(nil, AKFakeError());
 }
 
-// +[GADInterstitialAd loadFullScreenAdWithAdUnitID:request:completionHandler:]
-static void AKLoadInterstitialAd(id self, SEL _cmd, id adUnitID, id request, void (^completion)(id, NSError *)) {
-    AK_LOG(@"blocked +[GADInterstitialAd loadFullScreenAdWithAdUnitID:...]");
-    if (completion) completion(nil, AKFakeError());
-}
-
-// -[GADAppOpenAd|GADInterstitialAd presentFromRootViewController:]
 static void AKPresent(id self, SEL _cmd, UIViewController *vc) {
-    AK_LOG(@"blocked present: %@", NSStringFromClass([self class]));
+    AK_LOG(@"BLOCK present: %@", NSStringFromClass([self class]));
 }
 
-// -[GADRewardedAd presentFromRootViewController:userDidEarnRewardHandler:]
 static void AKPresentRewarded(id self, SEL _cmd, UIViewController *vc, id handler) {
-    AK_LOG(@"blocked rewarded present: %@", NSStringFromClass([self class]));
+    AK_LOG(@"BLOCK rewarded present: %@", NSStringFromClass([self class]));
 }
 
-// -[GADBannerView loadRequest:] / -[GADAdLoader loadRequest:]
 static void AKLoadRequest(id self, SEL _cmd, id request) {
-    AK_LOG(@"blocked loadRequest: on %@", NSStringFromClass([self class]));
+    AK_LOG(@"BLOCK %@ on %@", NSStringFromSelector(_cmd), NSStringFromClass([self class]));
     if ([self isKindOfClass:[UIView class]]) AKNotifyBannerFailure(self);
 }
 
-// -[GADAdLoader loadRequestWithTarget:] / -[GADBannerView loadWithTargeting:] 等内部入口
-static void AKLoadRequestTarget(id self, SEL _cmd, id target) {
-    AK_LOG(@"blocked %@ on %@", NSStringFromSelector(_cmd), NSStringFromClass([self class]));
+// 最终落地方法：不管请求从哪来（loadRequest: / autoload / 中介），都会走到这里
+static void AKLoadAdFinal(id self, SEL _cmd, id ad, id responseInfo, id err, id completion) {
+    AK_LOG(@"BLOCK %@ on %@", NSStringFromSelector(_cmd), NSStringFromClass([self class]));
+    if ([self isKindOfClass:[UIView class]]) AKNotifyBannerFailure(self);
 }
 
-// -[GADBannerView loadWithAdResponseString:] / -[GADAdLoader loadWithAdResponseString:]
 static void AKLoadResponseString(id self, SEL _cmd, id s) {
-    AK_LOG(@"blocked %@ on %@", NSStringFromSelector(_cmd), NSStringFromClass([self class]));
+    AK_LOG(@"BLOCK %@ on %@", NSStringFromSelector(_cmd), NSStringFromClass([self class]));
+    if ([self isKindOfClass:[UIView class]]) AKNotifyBannerFailure(self);
 }
 
-// +[GADAppOpenAd|GADInterstitialAd|GADRewardedAd preloadedAdWithAdUnitID:] —— 永远没有预加载广告
+// autoload 路径：广告位 ID 直接丢掉，SDK 无从加载
+static void AKSetAdUnitID(id self, SEL _cmd, id adUnitID) {
+    AK_LOG(@"BLOCK setAdUnitID: (%@) on %@", adUnitID, NSStringFromClass([self class]));
+}
+
+static void AKSetAutoload(id self, SEL _cmd, BOOL enabled) {
+    AK_LOG(@"BLOCK setAutoloadEnabled:%d on %@", enabled, NSStringFromClass([self class]));
+}
+
 static id AKPreloadedAd(id self, SEL _cmd, id adUnitID) {
     return nil;
 }
 
-// +[GADMobileAds startWithCompletionHandler:] —— 可选
 static void AKMobileAdsStart(id self, SEL _cmd, void (^completion)(id)) {
-    AK_LOG(@"blocked -[GADMobileAds startWithCompletionHandler:]");
+    AK_LOG(@"BLOCK -[GADMobileAds startWithCompletionHandler:]");
     if (completion) completion(nil);
 }
 
-// ======================= Vungle (Swift 类，ObjC 暴露) =======================
+// ======================= Vungle =======================
 
-static void AKVunglePresent(id self, SEL _cmd, id arg) {
-    AK_LOG(@"blocked Vungle %@ %@", NSStringFromClass([self class]), NSStringFromSelector(_cmd));
+static void AKVungleBlock(id self, SEL _cmd, id arg) {
+    AK_LOG(@"BLOCK Vungle %@ %@", NSStringFromClass([self class]), NSStringFromSelector(_cmd));
 }
 
 // ======================= Pangle / PAG =======================
 
-// Pangle 的 AdMob 中介适配器（这两个类是 Pangle 接入 AdMob mediation 的桥）
-static void AKPangleAdapterPresent(id self, SEL _cmd, UIViewController *vc) {
-    AK_LOG(@"blocked Pangle mediation present");
-}
-
-// PAGLInterstitialAd presentFromRootViewController: / PAGNativeExpressRewardedVideoAd showAdFromRootViewController:
 static void AKPangleShow(id self, SEL _cmd, UIViewController *vc) {
-    AK_LOG(@"blocked Pangle show: %@", NSStringFromClass([self class]));
+    AK_LOG(@"BLOCK Pangle show: %@", NSStringFromClass([self class]));
 }
 
 static void AKPangleShowRit(id self, SEL _cmd, UIViewController *vc, id a, id b) {
-    AK_LOG(@"blocked Pangle show(rit): %@", NSStringFromClass([self class]));
+    AK_LOG(@"BLOCK Pangle show(rit): %@", NSStringFromClass([self class]));
 }
 
-// Pangle 原生/信息流：不是 present，而是把视图注册进容器（实测 PAGLNativeAd 没有 present 方法）
 static void AKPangleRegisterContainer(id self, SEL _cmd, id container, id clickableViews) {
-    AK_LOG(@"blocked Pangle native registerContainer:withClickableViews:");
+    AK_LOG(@"BLOCK Pangle native registerContainer:withClickableViews:");
 }
 
-// PAGNativeAdsManager loadAdDataWithCount:
 static void AKPangleLoadNative(id self, SEL _cmd, id count) {
-    AK_LOG(@"blocked Pangle native load: loadAdDataWithCount:");
+    AK_LOG(@"BLOCK Pangle native %@ on %@", NSStringFromSelector(_cmd), NSStringFromClass([self class]));
+}
+
+static void AKPangleBannerLoad(id self, SEL _cmd, id slotID, id request, void (^completion)(id, NSError *)) {
+    AK_LOG(@"BLOCK Pangle banner load: %@", NSStringFromSelector(_cmd));
+    if (completion) completion(nil, AKFakeError());
+}
+
+static void AKPangleLoadAdData(id self, SEL _cmd) {
+    AK_LOG(@"BLOCK Pangle banner %@ on %@", NSStringFromSelector(_cmd), NSStringFromClass([self class]));
 }
 
 // ======================= 装配 =======================
 
-__attribute__((constructor))
-static void AdsKillerInit(void) {
+static void AKInstallHooks(void) {
     @autoreleasepool {
-        AK_LOG(@"=== AdsKiller loading ===");
+        gHooks = 0;
+        gMissed = 0;
 
         // ---- AdMob：全屏广告加载入口 ----
         Class appOpen = AKClass(@"GADAppOpenAd");
@@ -186,117 +192,140 @@ static void AdsKillerInit(void) {
         Class rewarded = AKClass(@"GADRewardedAd");
 
         SEL loadSel = NSSelectorFromString(@"loadWithAdUnitID:request:completionHandler:");
-        if (appOpen)     AKSwizzleClassMethod(appOpen, loadSel, (IMP)AKLoadFullScreenAd, NULL);
-        if (interstitial) AKSwizzleClassMethod(interstitial, loadSel, (IMP)AKLoadFullScreenAd, NULL);
-        if (rewarded)    AKSwizzleClassMethod(rewarded, loadSel, (IMP)AKLoadFullScreenAd, NULL);
-        if (interstitial)
-            AKSwizzleClassMethod(interstitial,
-                NSSelectorFromString(@"loadFullScreenAdWithAdUnitID:request:completionHandler:"),
-                (IMP)AKLoadInterstitialAd, NULL);
+        AKSwizzleClassMethod(appOpen, loadSel, (IMP)AKLoadFullScreenAd);
+        AKSwizzleClassMethod(interstitial, loadSel, (IMP)AKLoadFullScreenAd);
+        AKSwizzleClassMethod(rewarded, loadSel, (IMP)AKLoadFullScreenAd);
+        AKSwizzleClassMethod(interstitial,
+            NSSelectorFromString(@"loadFullScreenAdWithAdUnitID:request:completionHandler:"),
+            (IMP)AKLoadFullScreenAd);
 
-        // 预加载查询（防止中介层直接吐出已缓存广告）
         SEL preloadedSel = NSSelectorFromString(@"preloadedAdWithAdUnitID:");
-        if (appOpen)      AKSwizzleClassMethod(appOpen, preloadedSel, (IMP)AKPreloadedAd, NULL);
-        if (interstitial) AKSwizzleClassMethod(interstitial, preloadedSel, (IMP)AKPreloadedAd, NULL);
-        if (rewarded)     AKSwizzleClassMethod(rewarded, preloadedSel, (IMP)AKPreloadedAd, NULL);
+        AKSwizzleClassMethod(appOpen, preloadedSel, (IMP)AKPreloadedAd);
+        AKSwizzleClassMethod(interstitial, preloadedSel, (IMP)AKPreloadedAd);
+        AKSwizzleClassMethod(rewarded, preloadedSel, (IMP)AKPreloadedAd);
 
         // ---- AdMob：展示入口（兜底）----
         SEL presentSel = NSSelectorFromString(@"presentFromRootViewController:");
-        if (appOpen)      AKSwizzleInstanceMethod(appOpen, presentSel, (IMP)AKPresent, NULL);
-        if (interstitial) AKSwizzleInstanceMethod(interstitial, presentSel, (IMP)AKPresent, NULL);
-        if (rewarded)
-            AKSwizzleInstanceMethod(rewarded,
-                NSSelectorFromString(@"presentFromRootViewController:userDidEarnRewardHandler:"),
-                (IMP)AKPresentRewarded, NULL);
+        AKSwizzleInstanceMethod(appOpen, presentSel, (IMP)AKPresent);
+        AKSwizzleInstanceMethod(interstitial, presentSel, (IMP)AKPresent);
+        AKSwizzleInstanceMethod(rewarded,
+            NSSelectorFromString(@"presentFromRootViewController:userDidEarnRewardHandler:"),
+            (IMP)AKPresentRewarded);
 
-        // ---- AdMob：横幅 / 原生 ----
+        // ---- AdMob：横幅 / 原生（含 autoload 路径）----
         Class banner = AKClass(@"GADBannerView");
         Class adLoader = AKClass(@"GADAdLoader");
         SEL loadReq = NSSelectorFromString(@"loadRequest:");
-        if (banner)   AKSwizzleInstanceMethod(banner, loadReq, (IMP)AKLoadRequest, NULL);
-        if (adLoader) AKSwizzleInstanceMethod(adLoader, loadReq, (IMP)AKLoadRequest, NULL);
-        if (banner) {
-            AKSwizzleInstanceMethod(banner, NSSelectorFromString(@"loadWithTargeting:"), (IMP)AKLoadRequestTarget, NULL);
-            AKSwizzleInstanceMethod(banner, NSSelectorFromString(@"loadWithAdResponseString:"), (IMP)AKLoadResponseString, NULL);
-        }
-        if (adLoader) {
-            AKSwizzleInstanceMethod(adLoader, NSSelectorFromString(@"loadRequestWithTarget:"), (IMP)AKLoadRequestTarget, NULL);
-            AKSwizzleInstanceMethod(adLoader, NSSelectorFromString(@"loadWithAdResponseString:"), (IMP)AKLoadResponseString, NULL);
-        }
+        AKSwizzleInstanceMethod(banner, loadReq, (IMP)AKLoadRequest);
+        AKSwizzleInstanceMethod(adLoader, loadReq, (IMP)AKLoadRequest);
+        AKSwizzleInstanceMethod(banner, NSSelectorFromString(@"loadWithTargeting:"), (IMP)AKLoadRequest);
+        AKSwizzleInstanceMethod(banner, NSSelectorFromString(@"loadWithAdResponseString:"), (IMP)AKLoadResponseString);
+        AKSwizzleInstanceMethod(adLoader, NSSelectorFromString(@"loadRequestWithTarget:"), (IMP)AKLoadRequest);
+        AKSwizzleInstanceMethod(adLoader, NSSelectorFromString(@"loadWithAdResponseString:"), (IMP)AKLoadResponseString);
+        // autoload：把广告位 ID / 自动加载开关都变成空操作 → SDK 无从加载
+        AKSwizzleInstanceMethod(banner, NSSelectorFromString(@"setAdUnitID:"), (IMP)AKSetAdUnitID);
+        AKSwizzleInstanceMethod(banner, NSSelectorFromString(@"setAutoloadEnabled:"), (IMP)AKSetAutoload);
+        // 最终落地方法
+        AKSwizzleInstanceMethod(banner, NSSelectorFromString(@"loadAd:responseInfo:error:completionHandler:"), (IMP)AKLoadAdFinal);
+        AKSwizzleInstanceMethod(adLoader, NSSelectorFromString(@"loadAd:responseInfo:error:completionHandler:"), (IMP)AKLoadAdFinal);
 
 #if AK_KILL_SDK_INIT
-        Class mobileAds = AKClass(@"GADMobileAds");
-        if (mobileAds)
-            AKSwizzleInstanceMethod(mobileAds, NSSelectorFromString(@"startWithCompletionHandler:"), (IMP)AKMobileAdsStart, NULL);
+        AKSwizzleInstanceMethod(AKClass(@"GADMobileAds"),
+            NSSelectorFromString(@"startWithCompletionHandler:"), (IMP)AKMobileAdsStart);
 #endif
 
-        // ---- Vungle ----
+        // ---- Vungle（含横幅）----
         for (NSString *n in @[@"_TtC12VungleAdsSDK18VungleInterstitial",
                               @"_TtC12VungleAdsSDK14VungleRewarded",
                               @"_TtC12VungleAdsSDK12VungleBanner",
+                              @"_TtC12VungleAdsSDK16VungleBannerView",
                               @"_TtC12VungleAdsSDK12BasePublicAd"]) {
             Class c = AKClass(n);
             if (!c) continue;
-            if (class_getInstanceMethod(c, NSSelectorFromString(@"presentWith:")))
-                AKSwizzleInstanceMethod(c, NSSelectorFromString(@"presentWith:"), (IMP)AKVunglePresent, NULL);
-            if (class_getInstanceMethod(c, NSSelectorFromString(@"presentOn:")))
-                AKSwizzleInstanceMethod(c, NSSelectorFromString(@"presentOn:"), (IMP)AKVunglePresent, NULL);
-            if (class_getInstanceMethod(c, NSSelectorFromString(@"load:")))
-                AKSwizzleInstanceMethod(c, NSSelectorFromString(@"load:"), (IMP)AKVunglePresent, NULL);
+            AKSwizzleInstanceMethod(c, NSSelectorFromString(@"presentWith:"), (IMP)AKVungleBlock);
+            AKSwizzleInstanceMethod(c, NSSelectorFromString(@"presentOn:"), (IMP)AKVungleBlock);
+            AKSwizzleInstanceMethod(c, NSSelectorFromString(@"load:"), (IMP)AKVungleBlock);
         }
 
         // ---- Pangle ----
-        Class pagAdapter = AKClass(@"PAGInterfacePangleInterstitialAdapter");
-        if (pagAdapter && class_getInstanceMethod(pagAdapter, NSSelectorFromString(@"presentFromRootViewController:")))
-            AKSwizzleInstanceMethod(pagAdapter, NSSelectorFromString(@"presentFromRootViewController:"), (IMP)AKPangleAdapterPresent, NULL);
-
+        AKSwizzleInstanceMethod(AKClass(@"PAGInterfacePangleInterstitialAdapter"),
+            NSSelectorFromString(@"presentFromRootViewController:"), (IMP)AKPangleShow);
         for (NSString *n in @[@"PAGLInterstitialAd", @"PAGBannerAd"]) {
-            Class c = AKClass(n);
-            if (!c) continue;
-            if (class_getInstanceMethod(c, NSSelectorFromString(@"presentFromRootViewController:")))
-                AKSwizzleInstanceMethod(c, NSSelectorFromString(@"presentFromRootViewController:"), (IMP)AKPangleShow, NULL);
+            AKSwizzleInstanceMethod(AKClass(n), NSSelectorFromString(@"presentFromRootViewController:"), (IMP)AKPangleShow);
         }
-        // 原生/信息流（PAGLNativeAd 没有 present，走 registerContainer:withClickableViews:）
-        Class pagNative = AKClass(@"PAGLNativeAd");
-        if (pagNative) {
-            if (class_getInstanceMethod(pagNative, NSSelectorFromString(@"registerContainer:withClickableViews:")))
-                AKSwizzleInstanceMethod(pagNative, NSSelectorFromString(@"registerContainer:withClickableViews:"),
-                                        (IMP)AKPangleRegisterContainer, NULL);
-        }
+        // 横幅加载（v1 漏掉的就是这里）
+        Class pagBanner = AKClass(@"PAGBannerAd");
+        AKSwizzleInstanceMethod(pagBanner,
+            NSSelectorFromString(@"_loadAdWithSlotID:request:completionHandler:"), (IMP)AKPangleBannerLoad);
+        AKSwizzleClassMethod(pagBanner,
+            NSSelectorFromString(@"loadAdWithSlotID:request:completionHandler:"), (IMP)AKPangleBannerLoad);
+        Class pagExpress = AKClass(@"PAGNativeExpressBannerView");
+        AKSwizzleInstanceMethod(pagExpress, NSSelectorFromString(@"loadAdData"), (IMP)AKPangleLoadAdData);
+        AKSwizzleInstanceMethod(pagExpress, NSSelectorFromString(@"_loadAdDataByPublisher:"), (IMP)AKVungleBlock);
+        // 原生 / 信息流
+        AKSwizzleInstanceMethod(AKClass(@"PAGLNativeAd"),
+            NSSelectorFromString(@"registerContainer:withClickableViews:"), (IMP)AKPangleRegisterContainer);
         Class pagNativeMgr = AKClass(@"PAGNativeAdsManager");
-        if (pagNativeMgr) {
-            if (class_getInstanceMethod(pagNativeMgr, NSSelectorFromString(@"loadAdDataWithCount:")))
-                AKSwizzleInstanceMethod(pagNativeMgr, NSSelectorFromString(@"loadAdDataWithCount:"),
-                                        (IMP)AKPangleLoadNative, NULL);
-            if (class_getInstanceMethod(pagNativeMgr, NSSelectorFromString(@"loadAdDataWithCount:invokeByPublisher:")))
-                AKSwizzleInstanceMethod(pagNativeMgr, NSSelectorFromString(@"loadAdDataWithCount:invokeByPublisher:"),
-                                        (IMP)AKPangleRegisterContainer, NULL);
-        }
+        AKSwizzleInstanceMethod(pagNativeMgr, NSSelectorFromString(@"loadAdDataWithCount:"), (IMP)AKPangleLoadNative);
+        AKSwizzleInstanceMethod(pagNativeMgr,
+            NSSelectorFromString(@"loadAdDataWithCount:invokeByPublisher:"), (IMP)AKPangleLoadNative);
         Class pagRewarded = AKClass(@"PAGNativeExpressRewardedVideoAd");
-        if (pagRewarded) {
-            if (class_getInstanceMethod(pagRewarded, NSSelectorFromString(@"showAdFromRootViewController:")))
-                AKSwizzleInstanceMethod(pagRewarded, NSSelectorFromString(@"showAdFromRootViewController:"), (IMP)AKPangleShow, NULL);
-            if (class_getInstanceMethod(pagRewarded, NSSelectorFromString(@"showAdFromRootViewController:ritScene:ritSceneDescribe:")))
-                AKSwizzleInstanceMethod(pagRewarded, NSSelectorFromString(@"showAdFromRootViewController:ritScene:ritSceneDescribe:"), (IMP)AKPangleShowRit, NULL);
-        }
+        AKSwizzleInstanceMethod(pagRewarded, NSSelectorFromString(@"showAdFromRootViewController:"), (IMP)AKPangleShow);
+        AKSwizzleInstanceMethod(pagRewarded,
+            NSSelectorFromString(@"showAdFromRootViewController:ritScene:ritSceneDescribe:"), (IMP)AKPangleShowRit);
+
+        AK_LOG(@"=== %s installed %d hooks, %d classes missing ===", AK_VERSION, gHooks, gMissed);
+    }
+}
 
 #if AK_DISABLE_MEDIATION_INIT
-        // 官方 API：关闭聚合中介初始化（Pangle/Vungle/Moloco/InMobi 适配器不再初始化）
-        // 延后到主线程下一轮，确保 GADMobileAds 已完成类加载
-        dispatch_async(dispatch_get_main_queue(), ^{
-            @try {
-                Class mobileAds = AKClass(@"GADMobileAds");
-                if (mobileAds) {
-                    id shared = [(id<AKGADMobileAdsShim>)mobileAds sharedInstance];
-                    if ([shared respondsToSelector:@selector(disableMediationInitialization)]) {
-                        [(id<AKGADMobileAdsShim>)shared disableMediationInitialization];
-                        AK_LOG(@"mediation initialization disabled via GADMobileAds");
-                    }
-                }
-            } @catch (NSException *e) { AK_LOG(@"disable mediation failed: %@", e); }
-        });
+static void AKDisableMediation(void) {
+    @try {
+        Class mobileAds = AKClass(@"GADMobileAds");
+        if (mobileAds) {
+            id shared = [(id<AKGADMobileAdsShim>)mobileAds sharedInstance];
+            if ([shared respondsToSelector:@selector(disableMediationInitialization)]) {
+                [(id<AKGADMobileAdsShim>)shared disableMediationInitialization];
+                AK_LOG(@"mediation initialization disabled via GADMobileAds");
+            }
+        }
+    } @catch (NSException *e) { AK_LOG(@"disable mediation failed: %@", e); }
+}
 #endif
 
-        AK_LOG(@"=== AdsKiller ready ===");
+static BOOL gInstalled = NO;
+
+// +load 是比 constructor 更早且更可靠的挂载点：
+// dyld 调用 map_images 注册完所有镜像的类之后才会执行 +load，
+// 所以这里 NSClassFromString 一定能拿到 App / SDK 的类。
+@interface AdsKillerLoader : NSObject @end
+
+@implementation AdsKillerLoader
++ (void)load {
+    AK_LOG(@"=== AdsKiller %s loading (+load) ===", AK_VERSION);
+    gInstalled = YES;
+    AKInstallHooks();
+    // 有类没找到就先记着，留给 constructor / 延时重试再补一次
+}
+@end
+
+__attribute__((constructor))
+static void AdsKillerCtor(void) {
+    AK_LOG(@"=== AdsKiller %s (constructor) ===", AK_VERSION);
+    if (!gInstalled) { gInstalled = YES; AKInstallHooks(); }
+    else if (gMissed > 0) {
+        AK_LOG(@"retrying: %d classes were missing at +load time", gMissed);
+        AKInstallHooks();
     }
+    // 主线程下一轮再补一次，并关闭聚合中介初始化
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (gMissed > 0) {
+            AK_LOG(@"retrying on main queue: %d classes still missing", gMissed);
+            AKInstallHooks();
+        }
+#if AK_DISABLE_MEDIATION_INIT
+        AKDisableMediation();
+#endif
+        AK_LOG(@"=== AdsKiller %s ready (hooks=%d) ===", AK_VERSION, gHooks);
+    });
 }
