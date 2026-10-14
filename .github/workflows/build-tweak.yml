@@ -22,7 +22,35 @@ jobs:
       - name: 编译并打包 TrollFools 插件
         run: |
           chmod +x tweak/build_dylib.sh tweak/package_trollfools.sh
-          ./tweak/package_trollfools.sh
+          set +e
+          ./tweak/package_trollfools.sh > build.log 2>&1
+          rc=$?
+          set -e
+
+          echo "----- 构建输出（尾部 60 行） -----"
+          tail -60 build.log
+
+          # 日志写进 Job Summary（运行页匿名可见，方便没有 token 时排错）
+          {
+            echo "## 构建日志 (exit=$rc)"
+            echo '```'
+            tail -200 build.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY" || true
+
+          # 关键错误行同时发成注解（注解 API 匿名可读）
+          if [ "$rc" -ne 0 ]; then
+            grep -aiE "error|错误|not found|undefined" build.log | head -12 > errs.txt || true
+            if [ -s errs.txt ]; then
+              while IFS= read -r line; do
+                echo "::error::${line}"
+              done < errs.txt
+            else
+              echo "::error::构建失败但没有匹配到 error 关键字，见 Job Summary 里的完整日志"
+            fi
+          fi
+
+          exit $rc
 
       - name: 检查产物
         run: |

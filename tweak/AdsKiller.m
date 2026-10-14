@@ -13,7 +13,14 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
-#import <objc/message.h>
+#import <dispatch/dispatch.h>
+
+// 用协议声明代替 objc_msgSend 强转：ARC 下 objc_msgSend 强转容易编译报错，
+// 这里只是给编译器一个契约，运行时用的还是 GADMobileAds 自己的实现。
+@protocol AKGADMobileAdsShim <NSObject>
++ (instancetype)sharedInstance;
+- (void)disableMediationInitialization;
+@end
 
 #define AK_LOG(fmt, ...) NSLog(@"[AdsKiller] " fmt, ##__VA_ARGS__)
 
@@ -273,9 +280,9 @@ static void AdsKillerInit(void) {
             @try {
                 Class mobileAds = AKClass(@"GADMobileAds");
                 if (mobileAds) {
-                    id shared = ((id (*)(id, SEL))objc_msgSend)(mobileAds, NSSelectorFromString(@"sharedInstance"));
-                    if ([shared respondsToSelector:NSSelectorFromString(@"disableMediationInitialization")]) {
-                        ((void (*)(id, SEL))objc_msgSend)(shared, NSSelectorFromString(@"disableMediationInitialization"));
+                    id shared = [(id<AKGADMobileAdsShim>)mobileAds sharedInstance];
+                    if ([shared respondsToSelector:@selector(disableMediationInitialization)]) {
+                        [(id<AKGADMobileAdsShim>)shared disableMediationInitialization];
                         AK_LOG(@"mediation initialization disabled via GADMobileAds");
                     }
                 }
