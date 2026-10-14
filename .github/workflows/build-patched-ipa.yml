@@ -5,10 +5,16 @@ name: build-patched-ipa
 # ⚠️ 使用前必读：
 #   1. 原始 IPA 不能提交到仓库（有版权）。请把它作为 **release 资产** 上传，
 #      tag 用 base-ipa；或者用 base_ipa_url 指定一个私密下载地址。
+#      ★ 这个 release **必须是草稿（Draft）**！发布状态的 release 匿名就能下载，
+#        等于把原始 App 公开分发出去（本仓库曾经中过一次，务必检查）。
 #   2. publish_release（默认 true）会把改过的 IPA 挂成 **草稿 release（--draft）**：
 #      只有本仓库有写权限的人（也就是你自己）登录后才能看到和下载，匿名拿不到，
 #      所以不会构成公开分发。等确认可用后，再到 Releases 页面手动点 Publish 转正。
 #      注意：草稿比"仅登录可见"更严 —— 别人即使登录了，没有仓库写权限也看不到。
+#   3. 默认**不上传 Artifacts**（公开仓库的构件任何登录用户都能下载）。
+#      只有 publish_release=false 时才上传构件作为取文件的途径。
+#   4. 日志里不打印文件清单/内容；inputs 一律通过 env 传入，
+#      避免内联 ${{ }} 被替换成实际值后打进公开日志（私密 URL 会因此泄露）。
 
 on:
   workflow_dispatch:
@@ -51,22 +57,26 @@ jobs:
       - name: 获取原始 IPA
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 用 env 传参而不是在脚本里内联 ${{ inputs.x }}：
+          # 内联会被替换成实际值并原样打印到（公开仓库的）日志里，私密 URL 会因此泄露。
+          INPUT_IPA_URL: ${{ inputs.base_ipa_url }}
+          INPUT_TAG: ${{ inputs.base_release_tag }}
         run: |
           set -e
           mkdir -p base
-          if [ -n "${{ inputs.base_ipa_url }}" ]; then
-            echo "[*] 从 URL 下载"
-            curl -fsSL -o base/base.ipa "${{ inputs.base_ipa_url }}"
+          if [ -n "$INPUT_IPA_URL" ]; then
+            echo "[*] 从 URL 下载原始 IPA"
+            curl -fsSL -o base/base.ipa "$INPUT_IPA_URL"
           else
-            echo "[*] 从 release 资产下载 (tag=${{ inputs.base_release_tag }})"
-            gh release download "${{ inputs.base_release_tag }}" \
+            echo "[*] 从 release 资产下载原始 IPA (tag=$INPUT_TAG)"
+            gh release download "$INPUT_TAG" \
                -R "${{ github.repository }}" -p '*.ipa' -D base --clobber || {
-              echo "::error::没找到原始 IPA。请先把 qrcode-4.0.3.ipa 作为 release 资产上传（tag: ${{ inputs.base_release_tag }}），或填写 base_ipa_url。"
+              echo "::error::没找到原始 IPA。请先把 qrcode-4.0.3.ipa 作为 release 资产上传（tag: $INPUT_TAG），或填写 base_ipa_url。"
               exit 1
             }
           fi
-          ls -lh base
-          file base/base.ipa
+          # 只报大小，不列文件名/不打印内容
+          echo "[*] 原始 IPA 就绪，大小 $(wc -c < base/*.ipa) bytes"
 
       - name: 编译 hook dylib
         run: ./tweak/build_dylib.sh
@@ -92,7 +102,8 @@ jobs:
             cp tweak/entitlements.plist ents.plist
             echo "[*] entitlements 来源: 仓库预置兜底"
           fi
-          echo "----- entitlements -----"; cat ents.plist
+          # 不把 entitlements 内容打进日志，只报来源与项数
+          echo "[*] entitlements 就绪，来源与项数: $(grep -c '<key>' ents.plist) 项"
 
           python3 tweak/tools/inject_dylib.py "$APP" tweak/AdsKiller.dylib
 
@@ -122,8 +133,8 @@ jobs:
           export COPYFILE_DISABLE=1
           OUT="SimpleQR-4.0.3-noads.ipa"
           ( cd work && zip -qry "../$OUT" Payload -x '.*' -x '__MACOSX/*' )
-          ls -lh "$OUT"
-          unzip -l "$OUT" | head -20
+          # 只报大小，不列包内文件清单（避免把 App 内部结构打进出厂日志）
+          echo "[*] 打包完成，大小 $(wc -c < "$OUT") bytes"
           echo "OUT=$OUT" >> "$GITHUB_ENV"
 
       - name: 校验产物
@@ -147,7 +158,11 @@ jobs:
           print('OK: 注入与打包校验通过')
           EOF
 
-      - name: 上传构件
+      # ⚠️ 默认不上传 Artifacts：公开仓库的 Actions 构件，任何**登录**的 GitHub 用户都能下载，
+      #    等于把改过的 App 放在了"登录即可取"的地方。默认走下面的草稿 release（仅写权限可见）。
+      #    只有在不需要发布 release 时，才用上传构件作为取文件的途径。
+      - name: 上传构件（仅在未发布 release 时）
+        if: inputs.publish_release != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: SimpleQR-noads-ipa
@@ -158,9 +173,11 @@ jobs:
         if: inputs.publish_release == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 同样用 env 传参，避免替换后的值出现在日志里
+          INPUT_TAG: ${{ inputs.release_tag }}
         run: |
           set -e
-          TAG="${{ inputs.release_tag }}"
+          TAG="$INPUT_TAG"
           # --draft：草稿 release，只有本仓库有写权限的人（也就是你自己）登录后才能看到和下载，
           # 匿名访问者拿不到 —— 避免把改过的第三方 App 公开分发出去。
           gh release view "$TAG" -R "${{ github.repository }}" >/dev/null 2>&1 || \
