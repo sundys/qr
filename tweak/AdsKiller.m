@@ -22,6 +22,12 @@
 - (void)disableMediationInitialization;
 @end
 
+// 同理：给 banner 的 delegate 一个契约，否则 ARC 下对 id 发未声明的 selector 会直接编译报错
+// （GADBannerViewDelegate 的真实签名与此一致）
+@protocol AKBannerDelegateShim <NSObject>
+- (void)bannerView:(id)bannerView didFailToReceiveAdWithError:(NSError *)error;
+@end
+
 #define AK_LOG(fmt, ...) NSLog(@"[AdsKiller] " fmt, ##__VA_ARGS__)
 
 // ---------- 可配置开关 ----------
@@ -66,7 +72,8 @@ static NSError *AKFakeError(void) {
 static void AKNotifyBannerFailure(id bannerView) {
 #if AK_NOTIFY_BANNER_FAILURE
     @try {
-        id delegate = [bannerView valueForKey:@"delegate"];
+        id<AKBannerDelegateShim> delegate =
+            (id<AKBannerDelegateShim>)[bannerView valueForKey:@"delegate"];
         SEL sel = @selector(bannerView:didFailToReceiveAdWithError:);
         if (delegate && [delegate respondsToSelector:sel]) {
             [delegate bannerView:bannerView didFailToReceiveAdWithError:AKFakeError()];
