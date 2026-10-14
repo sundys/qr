@@ -1,0 +1,37 @@
+name: build-trollfools-plugin
+
+# 没有 macOS 设备时的替代方案：推到 GitHub 后用免费的 macOS runner 编译打包，
+# 然后在 Actions 页面下载 AdsKiller-trollfools 构件喂给 TrollFools。
+
+on:
+  push:
+    paths:
+      - 'tweak/**'
+      - '.github/workflows/build-tweak.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14          # arm64 runner，自带 Xcode 的 iPhoneOS SDK
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 ldid
+        run: brew install ldid || true
+
+      - name: 编译并打包 TrollFools 插件
+        run: |
+          chmod +x tweak/build_dylib.sh tweak/package_trollfools.sh
+          ./tweak/package_trollfools.sh
+
+      - name: 检查产物
+        run: |
+          ls -lh tweak/dist
+          file tweak/dist/AdsKiller.dylib
+
+      - name: 上传构件
+        uses: actions/upload-artifact@v4
+        with:
+          name: AdsKiller-trollfools
+          path: tweak/dist/*
+          if-no-files-found: error

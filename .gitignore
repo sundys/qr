@@ -1,0 +1,13 @@
+# ===== 不纳入版本管理：第三方 App 本体与砸壳内容 =====
+# 原始 IPA 和从里面解出来的 App 内容归属原作者，只在本机使用，不要推到远程。
+qrcode-4.0.3.ipa
+extracted/
+
+# ===== 构建产物 =====
+tweak/dist/
+tweak/build/
+tweak/*.dylib
+
+# ===== 系统垃圾 =====
+.DS_Store
+Thumbs.db

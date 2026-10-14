@@ -1,0 +1,14 @@
+# 全部按 LF 存储/检出：
+# - .sh 脚本带 CRLF 会在 macOS/Linux 上直接报 "$'\r': command not found"
+# - deb 的 control 文件也要求 LF
+* text=auto eol=lf
+
+*.sh    text eol=lf
+*.py    text eol=lf
+*.m     text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.plist text eol=lf
+control text eol=lf

@@ -1,0 +1,9 @@
+Package: com.sundys.adskiller
+Name: AdsKiller
+Version: @VERSION@
+Architecture: iphoneos-arm64
+Description: Block AdMob / Pangle / Vungle ads in SimpleQR (QR Code, com.sawadaru.qr). Personal use only.
+Maintainer: local build
+Author: local build
+Section: Tweaks
+Priority: optional
