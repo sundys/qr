@@ -112,6 +112,16 @@ def main():
         sys.exit('[!] add_library 失败')
     print(f'[2/4] 插入 {added.name}  (cmd 大小 {added.size}, 偏移 {hex(added.command_offset)} )')
 
+    # 关键：剥掉原有的代码签名。
+    # 砸壳/dump 出来的包签名往往已经失效，ldid 重签时会先去解析它，
+    # 解析失败会直接断言崩溃（实测 ldid.cpp(_assert) 挂掉）。
+    # 剥掉后是一个干净的未签名二进制，ldid 从零生成签名即可。
+    if bin_before.has_code_signature:
+        if not hasattr(bin_before, 'remove_signature'):
+            sys.exit('[!] 当前 LIEF 不支持 remove_signature，无法清除旧签名（升级 lief 后重试）')
+        bin_before.remove_signature()
+        print('[2/4] 已剥掉原有代码签名（失效签名会导致 ldid 重签时崩溃）')
+
     # 3) 写回
     out = exe_path + '.patched'
     bin_before.write(out)
@@ -136,7 +146,11 @@ def main():
     if size_changed - {'__LINKEDIT'}:
         print(f'[!] 校验失败：非 __LINKEDIT 段的大小变了: {size_changed}'); ok = False
     if '__LINKEDIT' in size_changed:
-        print('      注: __LINKEDIT 缩小 (旧代码签名被移除)，稍后需用 ldid 重签')
+        print('      注: __LINKEDIT 缩小（旧代码签名已移除），接下来用 ldid 重新签名')
+    if bin_after.has_code_signature:
+        print('[!] 校验失败：旧代码签名没有被清除（ldid 重签可能再次崩溃）'); ok = False
+    else:
+        print('      旧签名已清除，当前为未签名二进制')
 
     # 代码区（load commands 之后 ~ __TEXT 末尾）必须逐字节相同
     start = (after['sizeofcmds'] + 0xFFF) & ~0xFFF

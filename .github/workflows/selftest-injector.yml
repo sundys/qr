@@ -58,11 +58,14 @@ jobs:
       - name: 确认注入结果可被独立解析
         run: |
           python3 - <<'EOF'
-          import lief, sys
+          import lief
           b = lief.parse('Fake/Payload/FakeApp.app/FakeApp')
           libs = [l.name for l in b.libraries]
           assert '@executable_path/AdsKiller.dylib' in libs, libs
           print('OK: LC_LOAD_DYLIB 存在 ->', [l for l in libs if 'AdsKiller' in l])
+          # 旧签名必须被剥掉，否则 ldid 重签会断言崩溃
+          assert b.has_code_signature is False, '旧代码签名没有被剥掉'
+          print('OK: 旧代码签名已清除 (has_code_signature =', b.has_code_signature, ')')
           print('ncmds =', b.header.nb_cmds)
           EOF
 

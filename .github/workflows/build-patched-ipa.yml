@@ -80,21 +80,41 @@ jobs:
           BIN="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")"
           echo "BIN=$BIN" >> "$GITHUB_ENV"
 
-          # 关键顺序：必须先拿到原始签名里的 entitlements，注入会把旧签名丢掉
-          ldid -e "$APP/$BIN" > ents.plist || echo "（原二进制没有 entitlements，稍后用 ad-hoc 签名）"
-          echo "----- 原 entitlements -----"; cat ents.plist || true
+          # 关键顺序：必须在注入前取 entitlements（注入会把旧签名整个剥掉）。
+          # 砸壳包的签名常常是坏的，ldid -e 可能直接断言退出，所以容错 + 用仓库里
+          # 预置的 tweak/entitlements.plist 兜底（内容就是原包那三个 entitlement）。
+          ldid -e "$APP/$BIN" > ents.extracted 2>/dev/null || true
+          if head -c 5 ents.extracted 2>/dev/null | grep -q '<?xml'; then
+            cp ents.extracted ents.plist
+            echo "[*] entitlements 来源: 原二进制"
+          else
+            cp tweak/entitlements.plist ents.plist
+            echo "[*] entitlements 来源: 仓库预置兜底"
+          fi
+          echo "----- entitlements -----"; cat ents.plist
 
           python3 tweak/tools/inject_dylib.py "$APP" tweak/AdsKiller.dylib
+
+          python3 -c "import lief;b=lief.parse('$APP/$BIN');print('[*] 注入后 has_code_signature =', b.has_code_signature)"
 
       - name: 重签 + 打包
         run: |
           set -e
-          if [ -s ents.plist ]; then
-            ldid -S ents.plist "$APP/$BIN"
-          else
-            ldid -S "$APP/$BIN"
-          fi
-          ldid -S "$APP/AdsKiller.dylib"
+          # 依次尝试：ldid(带 entitlements) -> ldid(ad-hoc) -> codesign(带 entitlements) -> codesign(ad-hoc)
+          sign() {
+            local f="$1" e="${2:-}"
+            if [ -n "$e" ] && [ -s "$e" ] && ldid -S "$e" "$f" 2>/dev/null; then echo "      -> ldid + entitlements"; return 0; fi
+            if ldid -S "$f" 2>/dev/null; then echo "      -> ldid ad-hoc"; return 0; fi
+            if [ -n "$e" ] && [ -s "$e" ] && codesign -f -s - --entitlements "$e" "$f" 2>/dev/null; then echo "      -> codesign + entitlements"; return 0; fi
+            if codesign -f -s - "$f" 2>/dev/null; then echo "      -> codesign ad-hoc"; return 0; fi
+            return 1
+          }
+
+          echo "[*] 签名主程序 $BIN"
+          sign "$APP/$BIN" ents.plist || { echo "::error::主程序签名失败（ldid 与 codesign 都失败）"; exit 1; }
+
+          echo "[*] 签名注入的 dylib"
+          sign "$APP/AdsKiller.dylib" || { echo "::error::dylib 签名失败"; exit 1; }
 
           codesign -dv "$APP/$BIN" 2>&1 | head -8 || true
 

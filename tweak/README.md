@@ -195,9 +195,14 @@ App 的横幅可能的**加载路径**（v1 只覆盖了第一条，v2 全cover�
 2. Actions → **build-patched-ipa** → Run workflow。也可以用 `base_ipa_url` 指定别的私密地址。
 3. 跑完在 Artifacts 下载 **SimpleQR-noads-ipa**，就是已注入并重签好的 IPA。
 
-内部步骤：解包 → `ldid -e` 保存原 entitlements（**必须在注入前取**，注入会丢弃旧签名）→
-`tweak/tools/inject_dylib.py` 用 LIEF 插入 `LC_LOAD_DYLIB`
-（插进 header 空隙，逐段校验「代码区字节未变、段表未动」）→ `ldid -S` 重签 → 重新打包 → 校验产物。
+内部步骤：解包 → `ldid -e` 保存原 entitlements（**必须在注入前取**，注入会把旧签名整个剥掉；
+砸壳包签名常常是坏的、`ldid -e` 会崩，所以失败时用仓库预置的 `tweak/entitlements.plist` 兜底）→
+`tweak/tools/inject_dylib.py` 用 LIEF 插入 `LC_LOAD_DYLIB` 并**剥掉失效的旧代码签名**
+→ `ldid -S` 重签（失败自动退到 `codesign -f -s -`）→ 重新打包 → 校验产物。
+
+> ⚠️ **踩过的坑**：砸壳 IPA 的主程序里那份旧签名已经失效，**不剥掉的话 ldid 重签时会直接断言崩溃**
+> （报 `ldid.cpp(852): _assert(): false`）。所以注入后一定要 `remove_signature()`，
+> 让 ldid 面对一个干净的未签名二进制——这也是为什么 `ldid -S` 在我们自己编的 dylib 上一直是好的。
 
 > 注入流水线有一个**不需要原始 IPA 的自测**：`.github/workflows/selftest-injector.yml`
 > 会合成一个假的 arm64 App + 用真的 AdsKiller.dylib 跑完整注入+校验+打包。
