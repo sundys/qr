@@ -1,0 +1,148 @@
+name: build-patched-ipa
+
+# 在 CI 里把 AdsKiller.dylib 注入原始 IPA，重签后产出新的 IPA。
+#
+# ⚠️ 使用前必读：
+#   1. 原始 IPA 不能提交到仓库（有版权，且仓库是公开的）。请把它作为 **release 资产** 上传，
+#      tag 用 base-ipa；或者用 base_ipa_url 指定一个私密下载地址。
+#   2. publish_release=true 会把改过的 IPA 挂成 **公开可下载的 release 资产**，
+#      这等于公开分发修改后的第三方 App。仅在你确认要这么做时才打开；
+#      建议先把仓库改成 private（Settings -> General -> Danger Zone -> Change visibility）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_ipa_url:
+        description: '原始 IPA 下载地址（留空则从本仓库 release 资产下载）'
+        required: false
+        default: ''
+      base_release_tag:
+        description: '原始 IPA 所在的 release tag'
+        required: false
+        default: 'base-ipa'
+      publish_release:
+        description: '是否把产物挂成 release 资产（公开仓库=公开分发，默认否）'
+        required: true
+        type: choice
+        options: ['false', 'true']
+        default: 'false'
+      release_tag:
+        description: '发布用的 tag（publish_release=true 时生效）'
+        required: false
+        default: 'noads-4.0.3'
+
+jobs:
+  patch:
+    runs-on: macos-14
+    permissions:
+      contents: write          # 仅 publish_release=true 时需要
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装依赖 (lief / ldid / zip)
+        run: |
+          python3 -m pip install --quiet --break-system-packages lief \
+            || python3 -m pip install --quiet --user lief \
+            || pip3 install --quiet lief
+          brew install ldid || true
+          python3 -c "import lief; print('lief', lief.__version__)"
+
+      - name: 获取原始 IPA
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          mkdir -p base
+          if [ -n "${{ inputs.base_ipa_url }}" ]; then
+            echo "[*] 从 URL 下载"
+            curl -fsSL -o base/base.ipa "${{ inputs.base_ipa_url }}"
+          else
+            echo "[*] 从 release 资产下载 (tag=${{ inputs.base_release_tag }})"
+            gh release download "${{ inputs.base_release_tag }}" \
+               -R "${{ github.repository }}" -p '*.ipa' -D base --clobber || {
+              echo "::error::没找到原始 IPA。请先把 qrcode-4.0.3.ipa 作为 release 资产上传（tag: ${{ inputs.base_release_tag }}），或填写 base_ipa_url。"
+              exit 1
+            }
+          fi
+          ls -lh base
+          file base/base.ipa
+
+      - name: 编译 hook dylib
+        run: ./tweak/build_dylib.sh
+
+      - name: 解包 + 保存原 entitlements + 注入
+        run: |
+          set -e
+          unzip -q base/*.ipa -d work
+          APP="$(find work/Payload -maxdepth 1 -name '*.app' | head -1)"
+          test -n "$APP" || { echo "::error::IPA 里没有 Payload/*.app"; exit 1; }
+          echo "APP=$APP" >> "$GITHUB_ENV"
+          BIN="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")"
+          echo "BIN=$BIN" >> "$GITHUB_ENV"
+
+          # 关键顺序：必须先拿到原始签名里的 entitlements，注入会把旧签名丢掉
+          ldid -e "$APP/$BIN" > ents.plist || echo "（原二进制没有 entitlements，稍后用 ad-hoc 签名）"
+          echo "----- 原 entitlements -----"; cat ents.plist || true
+
+          python3 tweak/tools/inject_dylib.py "$APP" tweak/AdsKiller.dylib
+
+      - name: 重签 + 打包
+        run: |
+          set -e
+          if [ -s ents.plist ]; then
+            ldid -S ents.plist "$APP/$BIN"
+          else
+            ldid -S "$APP/$BIN"
+          fi
+          ldid -S "$APP/AdsKiller.dylib"
+
+          codesign -dv "$APP/$BIN" 2>&1 | head -8 || true
+
+          export COPYFILE_DISABLE=1
+          OUT="SimpleQR-4.0.3-noads.ipa"
+          ( cd work && zip -qry "../$OUT" Payload -x '.*' -x '__MACOSX/*' )
+          ls -lh "$OUT"
+          unzip -l "$OUT" | head -20
+          echo "OUT=$OUT" >> "$GITHUB_ENV"
+
+      - name: 校验产物
+        run: |
+          set -e
+          rm -rf verify && mkdir verify && unzip -q "$OUT" -d verify
+          APP="$(find verify/Payload -maxdepth 1 -name '*.app' | head -1)"
+          EXE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")"
+          python3 - "$APP" "$EXE" <<'EOF'
+          import os, sys, lief
+          app, exe = sys.argv[1], sys.argv[2]
+          main = os.path.join(app, exe)
+          b = lief.parse(main)
+          libs = [l.name for l in b.libraries]
+          assert '@executable_path/AdsKiller.dylib' in libs, libs
+          dylib = os.path.join(app, 'AdsKiller.dylib')
+          assert os.path.isfile(dylib), 'dylib 不在 app 里'
+          db = lief.parse(dylib)
+          print('main:', exe, '| ncmds', b.header.nb_cmds)
+          print('dylib:', os.path.getsize(dylib), 'bytes | filetype', db.header.file_type)
+          print('OK: 注入与打包校验通过')
+          EOF
+
+      - name: 上传构件
+        uses: actions/upload-artifact@v4
+        with:
+          name: SimpleQR-noads-ipa
+          path: SimpleQR-4.0.3-noads.ipa
+          if-no-files-found: error
+
+      - name: 发布为 release 资产（可选，默认关闭）
+        if: inputs.publish_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG="${{ inputs.release_tag }}"
+          gh release view "$TAG" -R "${{ github.repository }}" >/dev/null 2>&1 || \
+            gh release create "$TAG" -R "${{ github.repository }}" \
+              --title "SimpleQR 4.0.3 去广告版 ($TAG)" \
+              --notes "在原始 IPA 基础上注入 AdsKiller hook 去广告。仅供个人设备使用，请勿再分发。" || true
+          gh release upload "$TAG" "$OUT" -R "${{ github.repository }}" --clobber
+          echo "已发布: ${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG"

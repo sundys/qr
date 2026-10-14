@@ -1,0 +1,80 @@
+name: selftest-injector
+
+# 用「合成的假 App」验证注入流水线本身是否可用（不需要原始 IPA）：
+# 编译一个假的 arm64 主程序 + 假 dylib → 跑 tweak/tools/inject_dylib.py → 校验 → 打包成 ipa 形状。
+# 这样在真正上传 IPA 之前，就能确认 lief 安装、注入、校验、打包这几步都是通的。
+
+on:
+  push:
+    paths:
+      - 'tweak/tools/inject_dylib.py'
+      - 'tweak/build_dylib.sh'
+      - 'tweak/AdsKiller.m'
+      - '.github/workflows/selftest-injector.yml'
+  workflow_dispatch:
+
+jobs:
+  selftest:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装依赖 (lief / ldid)
+        run: |
+          python3 -m pip install --quiet --break-system-packages lief \
+            || python3 -m pip install --quiet --user lief \
+            || pip3 install --quiet lief
+          brew install ldid || true
+          python3 -c "import lief; print('lief', lief.__version__)"
+
+      - name: 编译真实的 hook dylib
+        run: ./tweak/build_dylib.sh
+
+      - name: 合成假 App
+        run: |
+          set -e
+          mkdir -p Fake/Payload/FakeApp.app
+          cat > /tmp/main.c <<'EOF'
+          #include <stdio.h>
+          int main(void){ printf("fake\n"); return 0; }
+          EOF
+          clang -O0 -o Fake/Payload/FakeApp.app/FakeApp /tmp/main.c
+          cat > Fake/Payload/FakeApp.app/Info.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleExecutable</key><string>FakeApp</string>
+            <key>CFBundleIdentifier</key><string>com.example.fake</string>
+          </dict></plist>
+          EOF
+          file Fake/Payload/FakeApp.app/FakeApp
+
+      - name: 注入 + 校验
+        run: |
+          python3 tweak/tools/inject_dylib.py Fake/Payload/FakeApp.app tweak/AdsKiller.dylib
+
+      - name: 确认注入结果可被独立解析
+        run: |
+          python3 - <<'EOF'
+          import lief, sys
+          b = lief.parse('Fake/Payload/FakeApp.app/FakeApp')
+          libs = [l.name for l in b.libraries]
+          assert '@executable_path/AdsKiller.dylib' in libs, libs
+          print('OK: LC_LOAD_DYLIB 存在 ->', [l for l in libs if 'AdsKiller' in l])
+          print('ncmds =', b.header.nb_cmds)
+          EOF
+
+      - name: 重签 + 打包成 ipa 形状
+        run: |
+          export COPYFILE_DISABLE=1
+          ldid -S Fake/Payload/FakeApp.app/FakeApp || true
+          ldid -S Fake/Payload/FakeApp.app/AdsKiller.dylib || true
+          ( cd Fake && zip -qry ../FakePatched.ipa Payload -x '.*' -x '__MACOSX/*' )
+          unzip -l FakePatched.ipa
+
+      - name: 上传自测产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: selftest-fake-ipa
+          path: FakePatched.ipa
+          if-no-files-found: error

@@ -184,6 +184,31 @@ App 的横幅可能的**加载路径**（v1 只覆盖了第一条，v2 全cover�
 
 ---
 
+### 路线 C：让 CI 直接产出注入后的 IPA（不用本地工具链）
+
+用 `.github/workflows/build-patched-ipa.yml`（GitHub Actions 的 macOS runner）在云端
+解包 → 注入 → 重签 → 打包：
+
+1. **把原始 IPA 传上去**：仓库 → Releases → Draft a new release → tag 填 `base-ipa` →
+   把 `qrcode-4.0.3.ipa` 拖进附件 → Publish。
+   （**不要** `git add` 提交它，`.gitignore` 已排除）
+2. Actions → **build-patched-ipa** → Run workflow。也可以用 `base_ipa_url` 指定别的私密地址。
+3. 跑完在 Artifacts 下载 **SimpleQR-noads-ipa**，就是已注入并重签好的 IPA。
+
+内部步骤：解包 → `ldid -e` 保存原 entitlements（**必须在注入前取**，注入会丢弃旧签名）→
+`tweak/tools/inject_dylib.py` 用 LIEF 插入 `LC_LOAD_DYLIB`
+（插进 header 空隙，逐段校验「代码区字节未变、段表未动」）→ `ldid -S` 重签 → 重新打包 → 校验产物。
+
+> 注入流水线有一个**不需要原始 IPA 的自测**：`.github/workflows/selftest-injector.yml`
+> 会合成一个假的 arm64 App + 用真的 AdsKiller.dylib 跑完整注入+校验+打包。
+
+> ⚠️ **这个仓库目前是 public**。原始 IPA 和改过的 IPA 一旦作为 release 资产放上去，
+> 就等于**公开分发**这份第三方 App。要走路线 C，建议先把仓库改成 private
+> （Settings → General → Danger Zone → Change visibility），并且不要打开 `publish_release`。
+> 只给自己设备用的话，路线 A（TrollFools 注入）其实更省事，也不涉及分发。
+
+---
+
 ## 4. 开关与调参（`AdsKiller.m` 顶部）
 
 | 宏 | 默认 | 作用 |
