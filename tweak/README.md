@@ -207,9 +207,12 @@ App 的横幅可能的**加载路径**（v1 只覆盖了第一条，v2 全cover�
 > 注入流水线有一个**不需要原始 IPA 的自测**：`.github/workflows/selftest-injector.yml`
 > 会合成一个假的 arm64 App + 用真的 AdsKiller.dylib 跑完整注入+校验+打包。
 
-> ⚠️ **这个仓库目前是 public**。原始 IPA 和改过的 IPA 一旦作为 release 资产放上去，
-> 就等于**公开分发**这份第三方 App。要走路线 C，建议先把仓库改成 private
-> （Settings → General → Danger Zone → Change visibility），并且不要打开 `publish_release`。
+> ⚠️ **这个仓库是 public，所以发布方式是有讲究的**：workflow 里的发布步骤用的是
+> **草稿 release（`--draft`）** —— 产物只有**本仓库有写权限的人（你自己）登录后**才能看到和下载，
+> 匿名访问者拿不到，因此不构成公开分发。等确认 IPA 可用之后，再到 Releases 页面手动点 Publish 转正
+> （转正那一刻它就公开了，这一步请自己想清楚再点）。
+>
+> 另外注意 `base-ipa` 那个存放**原始 IPA** 的 release，如果被转成公开，原始包同样是分发。
 > 只给自己设备用的话，路线 A（TrollFools 注入）其实更省事，也不涉及分发。
 
 ---
