@@ -28,7 +28,9 @@ jobs:
           python3 -c "import lief; print('lief', lief.__version__)"
 
       - name: 编译真实的 hook dylib
-        run: ./tweak/build_dylib.sh
+        run: |
+          chmod +x tweak/build_dylib.sh
+          ./tweak/build_dylib.sh
 
       - name: 合成假 App
         run: |
